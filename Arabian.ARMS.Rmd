@@ -1,0 +1,2236 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dada2)
+library(ShortRead)
+packageVersion("ShortRead")
+library(Biostrings)
+library(ggplot2)
+library(hiReadsProcessor)
+library(seqinr)
+library(phyloseq)
+library(dplyr)
+library(reshape2)
+
+```
+
+```{r}
+path <- "~/Documents/ARMS/COI"
+list.files(path)
+```
+
+
+Make a list of the forward and reverse fastq files (check the sequence names to make sure you run the right lines for the files). CONISMA files are interleaved. Repeat and switch forward and reverse
+
+```{r}
+fnFs <- sort(list.files(path, pattern = "R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "R2_001.fastq.gz", full.names = TRUE))
+
+```
+
+
+Designate the forward and reverse primers
+
+```{r}
+FWD <- "GGWACWGGWTGAACWGTWTAYCCYCC"
+
+REV <- "TANACYTCNGGRTGNCCRAARAAYCA"
+
+```
+
+Make a vector of the possible orientations of both the forward and revere primers
+
+```{r}
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+```
+
+Calculate the number of reads where the forward and reverse primers are found. In this case for the second sample in fnFs(and fnRs). Note this only finds exact matches.
+
+```{r}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs[[2]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs[[2]]))
+```
+
+Load up cutadapt for use in R
+
+```{r}
+cutadapt <- "/usr/local/bin/cutadapt" # CHANGE ME to the cutadapt path on your machine
+system2(cutadapt, args = "--version") # Run shell commands from R
+```
+
+Create a folder called cutadapt
+
+Run cutadapt for all files in fnFs/fnRs
+
+```{r}
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+
+# Trim FWD off of R1 (forward reads) - 
+R1.flags <- paste0("-g", " ^", FWD) 
+# Trim REV off of R2 (reverse reads)
+R2.flags <- paste0("-G", " ^", REV) 
+# Run Cutadapt
+for(i in seq_along(fnFs)) {
+  system2(cutadapt, args = c("-e 0.05 --discard-untrimmed", R1.flags, R2.flags,
+                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+                             fnFs[i], fnRs[i])) # input files
+}
+```
+
+
+Look at how many primers are left on your reads. This should be 0 now. Although with the ^ designation there are occassionally a few primers still present due to internal primer hits. These seem to be removed later on in the process. 
+
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+```
+
+
+Check that the forward and reverse reads are the same once cutadapt has been undertaken
+
+```{r}
+# Forward and reverse fastq filenames have the format:
+cutFs <- sort(list.files(path.cut, pattern = "R1_001.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "R2_001.fastq.gz", full.names = TRUE))
+
+if(length(cutRs) == length(cutRs)) print("Forward and reverse files match. Go forth and explore")
+if (length(cutRs) != length(cutRs)) stop("Forward and reverse files do not match. Better go back and have a check")
+
+
+# Extract sample names, assuming filenames have format:
+
+get.sample.name <- function(fname) strsplit(basename(fname), "_")[[1]][2]
+
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+```
+
+Plot the quality information of the forward and reverse reads. If less than 20 plots then plot all. If not then select a random 20 plots to check. 
+
+```{r}
+
+if(length(cutFs) <= 20) {
+  plotQualityProfile(cutFs) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  plotQualityProfile(filtpathR) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+} else {
+  rand_samples <- sample(size = 20, 1:length(cutFs)) # grab 20 random samples to plot
+  fwd_qual_plots <- plotQualityProfile(cutFs[rand_samples]) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  rev_qual_plots <- plotQualityProfile(cutRs[rand_samples]) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+
+fwd_qual_plots
+rev_qual_plots
+```
+
+Print out the forward quality plot
+
+```{r}
+jpeg(file="Quality.Plot.COI.F.jpg",res=300, width=15, height=8, units="in")
+fwd_qual_plots
+dev.off()
+```
+
+Print out the reverse quality plot
+
+```{r}
+jpeg(file="Quality.Plot.COI.R.jpg",res=300, width=15, height=8, units="in")
+rev_qual_plots
+dev.off()
+```
+
+Create path for filtered files
+
+```{r}
+filtpathF <- file.path(path.cut, "filtered", basename(cutFs))
+filtpathR <- file.path(path.cut, "filtered", basename(cutRs))
+```
+
+Trim files. Truncation length of 165 and 160 bp for forward and reverse respectively. maxEE of 4 and 6 for all except KAUST where 2 and 4 used.
+
+```{r}
+
+
+out <- filterAndTrim(cutFs, filtpathF, cutRs, filtpathR,
+ truncLen=c(165,160), maxEE=c(4,6), truncQ=2, maxN=0, rm.phix=TRUE,
+ compress=TRUE, verbose=TRUE, multithread=TRUE)
+
+out <- as.data.frame(out)
+
+out$perc <- out$reads.out/out$reads.in*100
+
+out
+```
+
+Check that files names matched
+
+```{r}
+sample.names <- sapply(strsplit(basename(filtpathF), "_"), `[`, 2) # Assumes filename = samplename_XXX.fastq.gz
+sample.namesR <- sapply(strsplit(basename(filtpathR), "_"), `[`, 2) # Assumes filename = samplename_XXX.fastq.gz
+if(identical(sample.names, sample.namesR)) {print("Files are still matching.....congratulations")
+  } else {stop("Forward and reverse files do not match.")}
+names(filtpathF) <- sample.names
+names(filtpathR) <- sample.namesR
+
+```
+
+Create error matrix for forward and reverse reads using 1e8 bases.
+
+```{r}
+set.seed(100) # set seed to ensure that randomized steps are replicatable
+
+# Learn forward error rates
+errF <- learnErrors(filtpathF, nbases=1e8, multithread=TRUE, verbose = TRUE)
+
+# Learn reverse error rates
+errR <- learnErrors(filtpathR, nbases=1e8, multithread=TRUE, verbose = TRUE)
+```
+
+Forward error plot 
+
+```{r}
+
+errF_plot <- plotErrors(errF, nominalQ=TRUE)
+
+errF_plot
+
+```
+
+Reverse error plot
+
+```{r}
+
+errR_plot <- plotErrors(errR, nominalQ=TRUE)
+errR_plot
+
+```
+
+Dereplicate sequences
+
+```{r}
+
+derepF <- derepFastq(filtpathF, verbose=TRUE)
+derepR <- derepFastq(filtpathR, verbose=TRUE)
+
+```
+
+ASV inferrence using pseudopooling
+
+```{r}
+
+dadaF.pseudo <- dada(derepF, err=errF, multithread=TRUE, pool="pseudo")
+dadaR.pseudo <- dada(derepR, err=errR, multithread=TRUE, pool="pseudo")
+
+```
+
+Merge forward and reverse reads with 0 mismatch and a min overlap of 10. 
+
+Create ASV table
+
+```{r}
+
+mergers <- mergePairs(dadaF.pseudo, derepF, dadaR.pseudo, derepR, maxMismatch = 0, minOverlap = 10, verbose=TRUE)
+seqtab <- makeSequenceTable(mergers)
+
+```
+
+Save ASV table
+
+```{r}
+
+split.dir.name <- sapply(strsplit(basename(path), "-"), `[`)
+
+path <- "~/Documents/ARMS/"  ## CHANGE ME to the directory containing the fastq files.
+
+saveRDS(seqtab, paste0(path, "ARMS_seqtab.COI.", split.dir.name,".rds"))
+
+```
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaF.pseudo, getN), sapply(dadaR.pseudo, getN), sapply(mergers, getN))
+colnames(track) <- c("input", "filtered", "perc.filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+
+track <- as.data.frame(track)
+
+track$perc.denoisedF <- track$denoisedF/track$input*100
+track$perc.denoisedR <- track$denoisedR/track$input*100
+track$perc.merged <- track$merged/track$input*100
+
+write.csv(track, paste0(path, "ARMS_track.COI.", split.dir.name,".csv"))
+```
+
+
+
+```{r}
+ARMS.merged <- mergeSequenceTables(ARMS_seqtab.COI.1, ARMS_seqtab.COI.2, ARMS_seqtab.COI.3, ARMS_seqtab.COI.4, ARMS_seqtab.COI.5, ARMS_seqtab.COI.6, ARMS_seqtab.COI.7)
+
+saveRDS(ARMS.merged, "~/Documents/ARMS/ARMS.merged.rds")
+
+```
+
+
+
+Trim the sequences to between 312 and 314 bp and remove chimeras.
+
+```{r}
+table(nchar(getSequences(ARMS.merged)))
+
+hist(nchar(getSequences(ARMS.merged)), main="Distribution of sequence lengths")
+
+ARMS.merged.2 <- ARMS.merged[,nchar(colnames(ARMS.merged)) %in% seq(312,314)]
+
+ARMS.merged.nochim <- removeBimeraDenovo(ARMS.merged.2, multithread=TRUE, verbose=TRUE)
+
+saveRDS(ARMS.merged.nochim, "~/Documents/ARMS/ARMS.merged.COI.nochim.rds")
+
+```
+
+Assign sequences against a combined BOLD and NCBI database.
+
+```{r}
+ARMS.merged.COI.nochim <- readRDS("~/Documents/ARMS/ARMS.merged.COI.nochim.rds")
+
+BOLDDB <- "~/Documents/ReferenceDB/BOLD.total.ftrimmed.fasta"
+
+
+output <-  paste0("~/Documents/ARMS/")
+
+# Load Datafile
+sq <- getSequences(ARMS.merged.COI.nochim)
+
+# Setup Output prefix for slice files (rds)
+file_name_prefix <- paste0(output, 'ARMS.merged.COI.nochim.tax.slice_')
+
+# Set chunksize
+CHUNKSIZE = 50000
+
+# Calculate number of slices and remainder
+NUM_SQ = length(sq)
+NUM_SLICES <- as.integer(NUM_SQ/CHUNKSIZE)
+LEN_REMAINDER <- as.integer(NUM_SQ%%CHUNKSIZE)
+
+# Compute full slices
+idx <- 0
+while (idx < NUM_SLICES)
+{
+  start_idx = (idx*CHUNKSIZE)+1
+  end_idx =   (idx+1)*CHUNKSIZE
+  fname = paste0(file_name_prefix, start_idx, '_', end_idx, '.rds')
+
+  result_slice <- assignTaxonomy(sq[start_idx:end_idx], BOLDDB, minBoot= 51, multithread=TRUE)
+  saveRDS(result_slice, fname)
+  idx <- idx+1
+}
+# Compute remainder if present
+if (LEN_REMAINDER!=0){
+  start_idx = (NUM_SLICES*CHUNKSIZE)+1
+  end_idx =   NUM_SQ
+  fname = paste0(file_name_prefix, start_idx, '_', end_idx, '.rds')
+
+  result_slice <- assignTaxonomy(sq[start_idx:end_idx], BOLDDB, minBoot= 51,  multithread=TRUE)
+  saveRDS(result_slice, fname)
+}
+
+
+```
+
+Combine taxonomy table together
+
+```{r}
+t1 <- readRDS("~/Documents/ARMS/ARMS.merged.COI.nochim.tax.slice_1_50000.rds")
+t2 <- readRDS("~/Documents/ARMS/ARMS.merged.COI.nochim.tax.slice_100001_150000.rds")
+t3 <- readRDS("~/Documents/ARMS/ARMS.merged.COI.nochim.tax.slice_150001_163480.rds")
+t4 <- readRDS("~/Documents/ARMS/ARMS.merged.COI.nochim.tax.slice_50001_1e+05.rds")
+
+
+taxa <- rbind(t1, t2, t3, t4)
+
+saveRDS(taxa, "ARMS.temporal.merged.COI.nochim.tax.rds")
+
+```
+
+
+Change the ASVs names to something more ammenable to being read. Output ASV table, taxonomy and fasta files with the new names
+
+```{r}
+
+ARMS.temporal.merged.nochim <- readRDS("~/Documents/ARMS/ARMS.merged.COI.nochim.rds")
+ARMS.temporal.merged.nochim.tax50 <- readRDS("~/Documents/ARMS/ARMS.temporal.merged.COI.nochim.tax.rds")
+
+
+asv_seqs <- colnames(ARMS.temporal.merged.nochim)
+asv_headers <- vector(dim(ARMS.temporal.merged.nochim)[2], mode="character")
+
+for (i in 1:dim(ARMS.temporal.merged.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+
+
+  # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "~/Documents/ARMS/ARMS.temporal.merged.nochim_ASVs.fa")
+
+  # count table:
+asv_tab <- t(ARMS.temporal.merged.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "~/Documents/ARMS/ARMS.temporal.merged.nochim_ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+  # tax table:
+asv_tax <- ARMS.temporal.merged.nochim.tax50
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "~/Documents/ARMS/ARMS.temporal.merged.nochim_ASVs_taxonomy.tsv", sep="\t", quote=F, col.names=NA)
+
+
+```
+
+Read the fasta file back into R
+
+```{r}
+path <- "~/Documents/ARMS/" 
+
+path.cut <- file.path(path, "splitseqs")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+
+
+x <- readDNAStringSet("ARMS.temporal.merged.nochim_ASVs.fa")
+
+```
+
+Split the fasta file into equal fractions. Roughly 1000 sequences per file
+
+```{r}
+
+  #Split the fasta file into 17 equal fractions (plus a couple left over)
+splitSeqsToFiles(x, 164, "fasta","splitseqs", "~/Documents/ARMS/splitseqs/")
+
+```
+
+Make list of the file names of these split sequences
+
+```{r}
+path <- "~/Documents/ARMS/splitseqs/"
+
+split.files <- sort(list.files(path, pattern = ".fasta", full.names = TRUE))
+
+```
+
+Create some output file names to use for MACSE
+
+```{r}
+
+
+get.sample.name <- function(fname) strsplit(basename(fname), ".fasta")[[1]][1]
+sample.names <- unname(sapply(split.files, get.sample.name))
+sample.names
+
+outputAA <- file.path(paste0(path, sample.names, "_AA.fa"))
+outputNT <- file.path(paste0(path, sample.names, "_NT.fa"))
+outputstats <- file.path(paste0(path, sample.names, "_stats.csv"))
+
+```
+
+Run MACSE using the invertebrate mitochondrial coding. Using an aligned invertebrate file from MIDORI. 
+
+```{r}
+javapath <- "/usr/bin/java"
+
+for(i in seq_along(split.files)) {
+  system2(javapath, args = c(" -jar ~/macse_v2.05.jar -prog enrichAlignment -align ~/Documents/ReferenceDB/MACSE/Midori_invert_macseNT.fa -seq ", split.files[i], "-gc_def 5 -maxSTOP_inSeq 0 -output_only_added_seq_ON =TRUE -fixed_alignment_ON =TRUE -maxDEL_inSeq 5 -maxFS_inSeq 0 -maxINS_inSeq 0  -out_AA ", outputAA[i], " -out_NT ", outputNT[i], " -out_tested_seq_info ", outputstats[i]))
+}
+
+```
+
+Make a table for psuedo and nonpseudo sequences
+
+```{r}
+path <- "~/Documents/ARMS/splitseqs/"
+
+split.files.res <- sort(list.files(path, pattern = "_stats.csv", full.names = TRUE))
+
+
+nonpseudo = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres<-read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "yes")
+  df <- data.frame(splitseqres1)
+  nonpseudo <- rbind(nonpseudo,df)
+  }
+
+pseudo = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres<-read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "no")
+  df <- data.frame(splitseqres1)
+  pseudo <- rbind(pseudo,df)
+  }
+
+```
+
+Subset those that were pseudogenes into a new fasta file
+
+```{r}
+fastafile <- read.fasta("ARMS.temporal.merged.nochim_ASVs.fa", seqtype="DNA", as.string=TRUE)
+
+fastafile1 <- fastafile[c(which(names(fastafile) %in% pseudo$name))]
+
+path <- "~/Documents/ARMS/" 
+
+path.cut <- file.path(path, "invert-pseudo")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+
+write.fasta(fastafile1, names=names(fastafile1), file.out = "~/Documents/ARMS/invert-pseudo/invertpseudo.fasta")
+```
+
+Read the fasta file back into R
+
+```{r}
+
+
+x <- readDNAStringSet("~/Documents/ARMS/invert-pseudo/invertpseudo.fasta")
+
+```
+
+Split the fasta file into equal fractions. Roughly 1000 sequences per file
+
+```{r}
+  #Split the fasta file into 2 equal fractions (plus a couple left over)
+splitSeqsToFiles(x, 5, "split.fasta","splitseqs", "~/Documents/ARMS/invert-pseudo/")
+
+```
+
+Make list of the file names of these split sequences
+
+```{r}
+path <- "~/Documents/ARMS/invert-pseudo/"
+
+split.files <- sort(list.files(path, pattern = "split.fasta", full.names = TRUE))
+
+```
+
+Create some output file names to use for MACSE
+
+```{r}
+
+
+get.sample.name <- function(fname) strsplit(basename(fname), ".split.fasta")[[1]][1]
+sample.names <- unname(sapply(split.files, get.sample.name))
+sample.names
+
+outputAA <- file.path(paste0(path, sample.names, "_euk_AA.fa"))
+outputNT <- file.path(paste0(path, sample.names, "_euk_NT.fa"))
+outputstats <- file.path(paste0(path, sample.names, "_euk_stats.csv"))
+
+```
+
+Run MACSE using the vertebrate mitochondrial coding.
+
+```{r}
+javapath <- "/usr/bin/java"
+
+for(i in seq_along(split.files)) {
+  system2(javapath, args = c(" -jar ~/macse_v2.05.jar -prog enrichAlignment -align ~/Documents/ReferenceDB/MACSE/chordata_NT.fa -seq ", split.files[i], "-gc_def 2 -maxSTOP_inSeq 0 -output_only_added_seq_ON =TRUE -fixed_alignment_ON =TRUE -maxDEL_inSeq 5 -maxFS_inSeq 0 -maxINS_inSeq 0  -out_AA ", outputAA[i], " -out_NT ", outputNT[i], " -out_tested_seq_info ", outputstats[i]))
+}
+
+
+```
+
+Make a table for psuedo and nonpseudo sequences
+
+
+```{r}
+path <- "~/Documents/ARMS/invert-pseudo/"
+
+split.files.res <- sort(list.files(path, pattern = "euk_stats.csv", full.names = TRUE))
+
+
+nonpseudo.euk = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres <- read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "yes")
+  df <- data.frame(splitseqres1)
+  nonpseudo.euk <- rbind(nonpseudo.euk,df)
+  }
+
+pseudo.euk = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres<-read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "no")
+  df <- data.frame(splitseqres1)
+  pseudo.euk <- rbind(pseudo.euk, df)
+  }
+
+```
+
+Output those ASVs that were not chimeras.
+
+```{r}
+pseudo.combined <- rbind(pseudo, pseudo.euk)
+
+pseudo.combined.names <- as.character(unique(pseudo.combined$name))
+
+nonpseudo.combined <- rbind(nonpseudo, nonpseudo.euk)
+
+nonpseudo.combined.names <- as.character(unique(nonpseudo.combined$name))
+
+write.csv(nonpseudo.combined.names, "nonpseudo.combined.names.csv")
+```
+
+
+
+
+```{r}
+
+ARMS.temporal.COI.nochim <- read.table("ARMS.temporal.merged.nochim_ASVs_counts.tsv", header = TRUE)
+```
+
+
+```{r}
+
+ARMS.temporal.COI.nochim.tax <- read.table("ARMS.temporal.merged.nochim_ASVs_taxonomy.tsv", header = TRUE)
+
+mapCOI<-read.csv("ARMS.temporal.COI.metadata.csv", h=T, row.names=1)
+
+nonpseudo.combined.names<-read.csv("nonpseudo.combined.names.csv", h=T, row.names=1)
+
+rep.seqs <- readDNAStringSet("ARMS.temporal.merged.nochim_ASVs.fa")
+
+ARMS.temporal.COI.nochim.mat <- as.matrix(t(ARMS.temporal.COI.nochim))
+ARMS.temporal.COI.nochim.tax.mat <- as.matrix(ARMS.temporal.COI.nochim.tax)
+
+ARMS.temporal.COI.ps <- phyloseq(otu_table(ARMS.temporal.COI.nochim.mat, taxa_are_rows=FALSE),
+                                  sample_data(mapCOI), 
+                                  tax_table(ARMS.temporal.COI.nochim.tax.mat),
+                                  rep.seqs)
+
+nonpseudo.combined.names$x <- as.character(nonpseudo.combined.names$x)                                           
+
+ARMS.temporal.COI.ps.nopseudo = prune_taxa(nonpseudo.combined.names$x, ARMS.temporal.COI.ps)
+
+ARMS.temporal.COI.ps.nopseudo = subset_taxa(ARMS.temporal.COI.ps.nopseudo, Kingdom=="Eukaryota")
+ARMS.temporal.COI.ps.nopseudo = subset_taxa(ARMS.temporal.COI.ps.nopseudo, Phylum!="")
+
+org.ss <- as.data.frame(sample_sums(ARMS.temporal.COI.ps))
+org.ss$Names <- rownames(org.ss)
+
+new.ss <- as.data.frame(sample_sums(ARMS.temporal.COI.ps.nopseudo))
+new.ss$Names <- rownames(new.ss)
+
+control.rem.sums <- dplyr::left_join(org.ss, new.ss, by="Names")
+
+colnames(control.rem.sums) <- c("Original", "Names", "New")
+
+control.rem.sums.final <- control.rem.sums %>%
+  mutate(perc = New/Original*100)
+
+
+
+#allTaxa = taxa_names(ARMS.temporal.COI.ps)
+#allTaxa <- allTaxa[!(allTaxa %in% nonpseudo.combined.names$x)]
+#ARMS.temporal.COI.ps.pseudo = prune_taxa(allTaxa, ARMS.temporal.COI.ps)
+
+```
+
+
+
+
+```{r}
+
+ARMS.temporal.COI.Batch1 = subset_samples(ARMS.temporal.COI.ps.nopseudo, Batch == "Batch1")
+ARMS.temporal.COI.Batch2 = subset_samples(ARMS.temporal.COI.ps.nopseudo, Batch == "Batch2") 
+ARMS.temporal.COI.Batch3 = subset_samples(ARMS.temporal.COI.ps.nopseudo, Batch == "Batch3")
+ARMS.temporal.COI.Batch4 = subset_samples(ARMS.temporal.COI.ps.nopseudo, Batch == "Batch4")
+
+
+ARMS.temporal.COI.Batch1_neg = subset_samples(ARMS.temporal.COI.Batch1, Reef == "Control")
+ARMS.temporal.COI.Batch2_neg = subset_samples(ARMS.temporal.COI.Batch2, Reef == "Control")
+ARMS.temporal.COI.Batch4_neg = subset_samples(ARMS.temporal.COI.Batch4, Reef == "Control")
+
+
+ARMS.temporal.COI.Batch1_neg_sums <- colSums(otu_table(ARMS.temporal.COI.Batch1_neg))
+ARMS.temporal.COI.Batch2_neg_sums <- colSums(otu_table(ARMS.temporal.COI.Batch2_neg))
+ARMS.temporal.COI.Batch4_neg_sums <- colSums(otu_table(ARMS.temporal.COI.Batch4_neg))
+
+
+ARMS.temporal.COI.Batch1_neg_sums_vec <- as.vector(ARMS.temporal.COI.Batch1_neg_sums)
+ARMS.temporal.COI.Batch2_neg_sums_vec <- as.vector(ARMS.temporal.COI.Batch2_neg_sums)
+ARMS.temporal.COI.Batch4_neg_sums_vec <- as.vector(ARMS.temporal.COI.Batch4_neg_sums)
+
+
+ARMS.temporal.COI.B1 = as(otu_table(ARMS.temporal.COI.Batch1), "matrix")
+ARMS.temporal.COI.B1df = as.data.frame(ARMS.temporal.COI.B1)
+ARMS.temporal.COI.B2 = as(otu_table(ARMS.temporal.COI.Batch2), "matrix")
+ARMS.temporal.COI.B2df = as.data.frame(ARMS.temporal.COI.B2)
+ARMS.temporal.COI.B3 = as(otu_table(ARMS.temporal.COI.Batch3), "matrix")
+ARMS.temporal.COI.B3df = as.data.frame(ARMS.temporal.COI.B3)
+ARMS.temporal.COI.B4 = as(otu_table(ARMS.temporal.COI.Batch4), "matrix")
+ARMS.temporal.COI.B4df = as.data.frame(ARMS.temporal.COI.B4)
+
+
+ARMS.temporal.COI.B1df[,1:length(ARMS.temporal.COI.B1df)] <- sweep(ARMS.temporal.COI.B1df[,1:length(ARMS.temporal.COI.B1df)],2,ARMS.temporal.COI.Batch1_neg_sums_vec)
+ARMS.temporal.COI.B2df[,1:length(ARMS.temporal.COI.B2df)] <- sweep(ARMS.temporal.COI.B2df[,1:length(ARMS.temporal.COI.B2df)],2,ARMS.temporal.COI.Batch2_neg_sums_vec)
+ARMS.temporal.COI.B4df[,1:length(ARMS.temporal.COI.B4df)] <- sweep(ARMS.temporal.COI.B4df[,1:length(ARMS.temporal.COI.B4df)],2,ARMS.temporal.COI.Batch4_neg_sums_vec)
+
+
+ARMS.temporal.COI.B1df <- replace(ARMS.temporal.COI.B1df, ARMS.temporal.COI.B1df < 0, 0)
+ARMS.temporal.COI.B2df <- replace(ARMS.temporal.COI.B2df, ARMS.temporal.COI.B2df < 0, 0)
+ARMS.temporal.COI.B3df <- replace(ARMS.temporal.COI.B3df, ARMS.temporal.COI.B3df < 0, 0)
+ARMS.temporal.COI.B4df <- replace(ARMS.temporal.COI.B4df, ARMS.temporal.COI.B4df < 0, 0)
+
+
+
+ARMS.temporal.COI.cleaned <- rbind(ARMS.temporal.COI.B1df, ARMS.temporal.COI.B2df, ARMS.temporal.COI.B3df, ARMS.temporal.COI.B4df)
+
+
+dim(ARMS.temporal.COI.cleaned) 
+
+```
+
+
+```{r}
+
+ARMS.temporal.COI.cleaned.ps <- phyloseq(otu_table(ARMS.temporal.COI.cleaned, taxa_are_rows=FALSE), 
+                                          sample_data(mapCOI), 
+                                          tax_table(ARMS.temporal.COI.nochim.tax.mat),
+                                          rep.seqs)
+
+
+
+org.ss <- as.data.frame(sample_sums(ARMS.temporal.COI.ps))
+org.ss$Names <- rownames(org.ss)
+
+new.ss <- as.data.frame(sample_sums(ARMS.temporal.COI.cleaned.ps))
+new.ss$Names <- rownames(new.ss)
+
+control.rem.sums <- dplyr::left_join(org.ss, new.ss, by="Names")
+
+colnames(control.rem.sums) <- c("Original", "Names", "New")
+
+control.rem.sums <- control.rem.sums %>%
+  mutate(perc = New/Original*100)
+
+control.rem.sums
+```
+
+
+
+
+```{r}
+
+
+tax.clean <- data.frame(tax_table(ARMS.temporal.COI.cleaned.ps))
+
+for (i in 1:6){ tax.clean[,i] <- as.character(tax.clean[,i])}
+
+tax.clean[is.na(tax.clean)] <- ""
+
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,2] == ""){
+    kingdom <- paste("Unclassified_Kingdom_", tax.clean[i,1], sep = "")
+    tax.clean[i, 2:6] <- kingdom
+  } else if (tax.clean[i,3] == ""){
+    phylum <- paste("Unclassified_Phylum_", tax.clean[i,2], sep = "")
+    tax.clean[i, 3:6] <- phylum
+  } else if (tax.clean[i,4] == ""){
+    class <- paste("Unclassified_Class_", tax.clean[i,3], sep = "")
+    tax.clean[i, 4:6] <- class
+  } else if (tax.clean[i,5] == ""){
+    order <- paste("Unclassified_Order_", tax.clean[i,4], sep = "")
+    tax.clean[i, 5:6] <- order
+  } else if (tax.clean[i,6] == ""){
+    tax.clean$Genus[i] <- paste("Unclassified_Family",tax.clean$Family[i], sep = "_")
+  } 
+}
+
+tax_table(ARMS.temporal.COI.cleaned.ps) <- as.matrix(tax.clean)
+```
+
+
+
+#Subset
+
+
+```{r}
+mapCOI <- read.csv("ARMS.temporal.COI.metadata.csv", h=T, row.names=1)
+
+sample_data(ARMS.temporal.COI.cleaned.ps) <- sample_data(mapCOI)
+
+
+
+
+Period3 <- subset_samples(ARMS.temporal.COI.cleaned.ps, Period=="Period3")
+
+Period3.sessile <- subset_samples(ARMS.temporal.COI.cleaned.ps, Fraction=="Sessile")
+
+
+Period3.sessile = filter_taxa(Period3.sessile, function(x) mean(x) > 0, TRUE)
+
+
+```
+
+#Save 2019 table
+
+
+```{r}
+  
+ps.otutable <- as.data.frame(as.matrix(t(otu_table(Period3))))
+ps.otutable1 <- tibble::rownames_to_column(ps.otutable, var="ASVs")
+
+ps.otutable.tax <- as.data.frame(as.matrix(tax_table(Period3)))
+ps.otutable.tax1 <- tibble::rownames_to_column(ps.otutable.tax, var="ASVs")
+
+table <- dplyr::left_join(ps.otutable1, ps.otutable.tax1, by = "ASVs")
+write.csv(table, paste("~/Documents/Bioinformatics/ARMStemporal/Period3.csv", sep = ""), row.names = FALSE)
+
+sd <- as.data.frame(as.matrix(sample_data(Period3)))
+
+write.csv(sd, paste("~/Documents/Bioinformatics/ARMStemporal/Period3.sampledata.table.csv", sep = ""))
+```
+
+
+
+#Sessile graph matrix
+
+```{r}
+
+
+sample_data(Period3.sessile)$ARMS <-as.factor(sample_data(Period3.sessile)$ARMS)
+sample_data(Period3.sessile)$Reef <-as.factor(sample_data(Period3.sessile)$Reef)
+sample_data(Period3.sessile)$Region <-as.factor(sample_data(Period3.sessile)$Region)
+sample_data(Period3.sessile)$Fraction <-as.factor(sample_data(Period3.sessile)$Fraction)
+sample_data(Period3.sessile)$Fraction2 <-as.factor(sample_data(Period3.sessile)$Fraction2)
+sample_data(Period3.sessile)$Period <-as.factor(sample_data(Period3.sessile)$Period)
+sample_data(Period3.sessile)$Shared2 <-as.factor(sample_data(Period3.sessile)$Shared2)
+sample_data(Period3.sessile)$Shared3 <-as.factor(sample_data(Period3.sessile)$Shared3)
+
+Period3.sessile.reef <- merge_samples(Period3.sessile, "Region")
+
+Period3.sessile.pruned <- prune_samples(sample_sums(Period3.sessile.reef)>7500, Period3.sessile.reef)
+
+Period3.sessile.rare <- rarefy_even_depth(Period3.sessile.pruned, sample.size = min(sample_sums(Period3.sessile.pruned)), 
+                                                       replace = FALSE, trimOTUs = TRUE, rngseed = 81, verbose = TRUE)
+
+Period3.sessile.rare_perc = transform_sample_counts(Period3.sessile.rare, function(OTU) OTU/sum(OTU)*100)
+
+
+Period3.sessile.rare_perc1 = filter_taxa(Period3.sessile.rare_perc, function(x) mean(x) > 0.0001, TRUE)
+
+
+tab <- as.data.frame(as.matrix(otu_table(Period3.sessile.rare_perc1)))
+
+tab <- t(tab)
+
+
+graph <- graph_from_incidence_matrix(tab)
+
+
+deg <- degree(graph, mode="all")
+V(graph)$deg <- deg
+
+
+V(graph)$color <- "yellow" 
+V(graph)[deg == 1 ]$color <- "pink" 
+V(graph)[deg >= 5 ]$color <- "red" 
+V(graph)[type == "TRUE" ]$color <- "blue" 
+
+V(graph)[name == "ASV_196"]$color <- "orange"
+V(graph)[name == "ASV_678"]$color <- "orange"
+V(graph)[name == "ASV_195"]$color <- "orange"
+V(graph)[name == "ASV_76"]$color <- "orange"
+V(graph)[name == "ASV_170"]$color <- "orange"
+V(graph)[name == "ASV_608"]$color <- "orange"
+V(graph)[name == "ASV_310"]$color <- "orange"
+V(graph)[name == "ASV_9"]$color <- "orange"
+V(graph)[name == "ASV_27"]$color <- "orange"
+V(graph)[name == "ASV_411"]$color <- "orange"
+V(graph)[name == "ASV_90"]$color <- "orange"
+V(graph)[name == "ASV_11"]$color <- "orange"
+V(graph)[name == "ASV_59"]$color <- "orange"
+V(graph)[name == "ASV_16"]$color <- "orange"
+V(graph)[name == "ASV_50"]$color <- "orange"
+V(graph)[name == "ASV_53"]$color <- "orange"
+V(graph)[name == "ASV_94"]$color <- "orange"
+V(graph)[name == "ASV_62"]$color <- "orange"
+V(graph)[name == "ASV_17"]$color <- "orange"
+V(graph)[name == "ASV_205"]$color <- "orange"
+V(graph)[name == "ASV_28"]$color <- "orange"
+V(graph)[name == "ASV_13"]$color <- "orange"
+V(graph)[name == "ASV_4"]$color <- "orange"
+V(graph)[name == "ASV_183"]$color <- "orange"
+
+
+
+V(graph)$label <- ""
+V(graph)[name == "Central"]$label <- "CRS" 
+V(graph)[name == "Gulf"]$label <- "AG" 
+V(graph)[name == "North"]$label <- "NRS" 
+V(graph)[name == "Oman"]$label <- "OG" 
+V(graph)[name == "South"]$label <- "SRS" 
+
+#shape <- c("circle", "square")
+#plot(graph,
+#     vertex.color = V(graph)$color,
+#    vertex.size=V(graph)$size, vertex.label=NA)
+
+#write.graph(graph,file="graph_sessile.gml",format="gml")
+
+```
+
+#106 graph matrix
+
+
+```{r}
+mapCOI <- read.csv("ARMS.temporal.COI.metadata.csv", h=T, row.names=1)
+
+sample_data(ARMS.temporal.COI.cleaned.ps) <- sample_data(mapCOI)
+
+
+
+
+Period3 <- subset_samples(ARMS.temporal.COI.cleaned.ps, Period=="Period3")
+
+Period3.106 <- subset_samples(ARMS.temporal.COI.cleaned.ps, Fraction=="106")
+
+
+Period3.106 = filter_taxa(Period3.106, function(x) mean(x) > 0, TRUE)
+
+
+sample_data(Period3.106)$ARMS <-as.factor(sample_data(Period3.106)$ARMS)
+sample_data(Period3.106)$Reef <-as.factor(sample_data(Period3.106)$Reef)
+sample_data(Period3.106)$Region <-as.factor(sample_data(Period3.106)$Region)
+sample_data(Period3.106)$Fraction <-as.factor(sample_data(Period3.106)$Fraction)
+sample_data(Period3.106)$Fraction2 <-as.factor(sample_data(Period3.106)$Fraction2)
+sample_data(Period3.106)$Period <-as.factor(sample_data(Period3.106)$Period)
+sample_data(Period3.106)$Shared2 <-as.factor(sample_data(Period3.106)$Shared2)
+sample_data(Period3.106)$Shared3 <-as.factor(sample_data(Period3.106)$Shared3)
+
+Period3.106.reef <- merge_samples(Period3.106, "Region")
+
+Period3.106.pruned <- prune_samples(sample_sums(Period3.106.reef)>7500, Period3.106.reef)
+
+Period3.106.rare <- rarefy_even_depth(Period3.106.pruned, sample.size = min(sample_sums(Period3.106.pruned)), 
+                                                       replace = FALSE, trimOTUs = TRUE, rngseed = 81, verbose = TRUE)
+
+Period3.106.rare_perc = transform_sample_counts(Period3.106.rare, function(OTU) OTU/sum(OTU)*100)
+
+
+Period3.106.rare_perc1 = filter_taxa(Period3.106.rare_perc, function(x) mean(x) > 0.0001, TRUE)
+
+
+tab <- as.data.frame(as.matrix(otu_table(Period3.106.rare_perc1)))
+
+tab <- t(tab)
+
+
+graph <- graph_from_incidence_matrix(tab)
+
+
+deg <- degree(graph, mode="all")
+V(graph)$deg <- deg
+
+
+V(graph)$color <- "yellow" 
+V(graph)[deg == 1 ]$color <- "pink" 
+V(graph)[deg >= 5 ]$color <- "red" 
+V(graph)[type == "TRUE" ]$color <- "blue" 
+
+V(graph)[name == "ASV_601"]$color <- "orange"
+V(graph)[name == "ASV_267"]$color <- "orange"
+V(graph)[name == "ASV_392"]$color <- "orange"
+V(graph)[name == "ASV_783"]$color <- "orange"
+V(graph)[name == "ASV_340"]$color <- "orange"
+V(graph)[name == "ASV_196"]$color <- "orange"
+V(graph)[name == "ASV_157"]$color <- "orange"
+V(graph)[name == "ASV_20"]$color <- "orange"
+V(graph)[name == "ASV_7"]$color <- "orange"
+V(graph)[name == "ASV_16"]$color <- "orange"
+V(graph)[name == "ASV_1"]$color <- "orange"
+V(graph)[name == "ASV_19"]$color <- "orange"
+V(graph)[name == "ASV_22"]$color <- "orange"
+V(graph)[name == "ASV_208"]$color <- "orange"
+V(graph)[name == "ASV_311"]$color <- "orange"
+V(graph)[name == "ASV_53"]$color <- "orange"
+V(graph)[name == "ASV_245"]$color <- "orange"
+V(graph)[name == "ASV_62"]$color <- "orange"
+V(graph)[name == "ASV_13"]$color <- "orange"
+V(graph)[name == "ASV_4"]$color <- "orange"
+V(graph)[name == "ASV_28"]$color <- "orange"
+V(graph)[name == "ASV_120"]$color <- "orange"
+V(graph)[name == "ASV_250"]$color <- "orange"
+V(graph)[name == "ASV_184"]$color <- "orange"
+V(graph)[name == "ASV_205"]$color <- "orange"
+V(graph)[name == "ASV_399"]$color <- "orange"
+V(graph)[name == "ASV_66"]$color <- "orange"
+
+
+
+V(graph)$label <- ""
+V(graph)[name == "Central"]$label <- "CRS" 
+V(graph)[name == "Gulf"]$label <- "AG" 
+V(graph)[name == "North"]$label <- "NRS" 
+V(graph)[name == "Oman"]$label <- "OG" 
+V(graph)[name == "South"]$label <- "SRS" 
+
+#shape <- c("circle", "square")
+#plot(graph,
+#     vertex.color = V(graph)$color,
+#    vertex.size=V(graph)$size, vertex.label=NA)
+
+#write.graph(graph,file="graph_106.gml",format="gml")
+
+```
+
+
+#500 graph matrix
+
+
+```{r}
+mapCOI <- read.csv("ARMS.temporal.COI.metadata.csv", h=T, row.names=1)
+
+sample_data(ARMS.temporal.COI.cleaned.ps) <- sample_data(mapCOI)
+
+
+
+
+Period3 <- subset_samples(ARMS.temporal.COI.cleaned.ps, Period=="Period3")
+
+Period3.500 <- subset_samples(ARMS.temporal.COI.cleaned.ps, Fraction=="500")
+
+
+Period3.500 = filter_taxa(Period3.500, function(x) mean(x) > 0, TRUE)
+
+
+
+
+
+sample_data(Period3.500)$ARMS <-as.factor(sample_data(Period3.500)$ARMS)
+sample_data(Period3.500)$Reef <-as.factor(sample_data(Period3.500)$Reef)
+sample_data(Period3.500)$Region <-as.factor(sample_data(Period3.500)$Region)
+sample_data(Period3.500)$Fraction <-as.factor(sample_data(Period3.500)$Fraction)
+sample_data(Period3.500)$Fraction2 <-as.factor(sample_data(Period3.500)$Fraction2)
+sample_data(Period3.500)$Period <-as.factor(sample_data(Period3.500)$Period)
+sample_data(Period3.500)$Shared2 <-as.factor(sample_data(Period3.500)$Shared2)
+sample_data(Period3.500)$Shared3 <-as.factor(sample_data(Period3.500)$Shared3)
+
+Period3.500.reef <- merge_samples(Period3.500, "Region")
+
+Period3.500.pruned <- prune_samples(sample_sums(Period3.500.reef)>7500, Period3.500.reef)
+
+Period3.500.rare <- rarefy_even_depth(Period3.500.pruned, sample.size = min(sample_sums(Period3.500.pruned)), 
+                                                       replace = FALSE, trimOTUs = TRUE, rngseed = 81, verbose = TRUE)
+
+Period3.500.rare_perc = transform_sample_counts(Period3.500.rare, function(OTU) OTU/sum(OTU)*100)
+
+
+Period3.500.rare_perc1 = filter_taxa(Period3.500.rare_perc, function(x) mean(x) > 0.0001, TRUE)
+
+
+tab <- as.data.frame(as.matrix(otu_table(Period3.500.rare_perc1)))
+
+tab <- t(tab)
+
+
+graph <- graph_from_incidence_matrix(tab)
+
+
+deg <- degree(graph, mode="all")
+V(graph)$deg <- deg
+
+
+V(graph)$color <- "yellow" 
+V(graph)[deg == 1 ]$color <- "pink" 
+V(graph)[deg >= 5 ]$color <- "red" 
+V(graph)[type == "TRUE" ]$color <- "blue" 
+
+V(graph)[name == "ASV_111"]$color <- "orange"
+V(graph)[name == "ASV_42"]$color <- "orange"
+V(graph)[name == "ASV_16"]$color <- "orange"
+V(graph)[name == "ASV_154"]$color <- "orange"
+V(graph)[name == "ASV_152"]$color <- "orange"
+V(graph)[name == "ASV_176"]$color <- "orange"
+V(graph)[name == "ASV_137"]$color <- "orange"
+V(graph)[name == "ASV_90"]$color <- "orange"
+V(graph)[name == "ASV_92"]$color <- "orange"
+V(graph)[name == "ASV_53"]$color <- "orange"
+V(graph)[name == "ASV_581"]$color <- "orange"
+V(graph)[name == "ASV_477"]$color <- "orange"
+V(graph)[name == "ASV_486"]$color <- "orange"
+V(graph)[name == "ASV_123"]$color <- "orange"
+V(graph)[name == "ASV_4"]$color <- "orange"
+V(graph)[name == "ASV_28"]$color <- "orange"
+V(graph)[name == "ASV_120"]$color <- "orange"
+V(graph)[name == "ASV_265"]$color <- "orange"
+V(graph)[name == "ASV_205"]$color <- "orange"
+
+
+
+V(graph)$label <- ""
+V(graph)[name == "Central"]$label <- "CRS" 
+V(graph)[name == "Gulf"]$label <- "AG" 
+V(graph)[name == "North"]$label <- "NRS" 
+V(graph)[name == "Oman"]$label <- "OG" 
+V(graph)[name == "South"]$label <- "SRS" 
+
+#shape <- c("circle", "square")
+#plot(graph,
+#     vertex.color = V(graph)$color,
+#    vertex.size=V(graph)$size, vertex.label=NA)
+
+#write.graph(graph,file="graph_500.gml",format="gml")
+
+```
+
+
+
+
+#Sessile Indicators
+
+```{r}
+
+Period3.sessile.reef <- merge_samples(Period3.sessile, "Reef")
+
+taxanames <- taxa_names(Period3.sessile.rare_perc1)
+
+Period3.sessile.reef_filtered <- prune_taxa(as.character(taxanames), Period3.sessile.reef)
+
+
+#ASV table to proportion
+Period3.sessile.rare_perc = transform_sample_counts(Period3.sessile.reef_filtered, function(OTU) OTU/sum(OTU)*100)
+#Make dataframe
+Period3.sessile.rare_perc.df <- as.data.frame(otu_table(Period3.sessile.rare_perc))
+
+#Data frame of sample data
+Period3.sessile.rare_perc.sd <- as.data.frame(sample_data(Period3.sessile.rare_perc))
+
+#Period3.sessile.rare_perc.sd$Region <- rownames(Period3.sessile.rare_perc.sd)
+
+#Make it repeatable by setting seed
+
+set.seed(56)
+
+#Uses package indicspecies. Finds indicator species of each level within the factor (I ran this as depth as this is the level within each factor).
+indval.Period3.sessile <- multipatt(Period3.sessile.rare_perc.df, Period3.sessile.rare_perc.sd$Region, control=how(nperm=999))
+
+#Output as a data frame
+
+indval.Period3.sessile.df <- as.data.frame(indval.Period3.sessile$sign)
+
+#Use data.table package to get rownames as a column (this can be done in dplyr as well as can the below steps. Probably easier now days to do it with dplyr).
+
+indval.Period3.sessile.df2 <- setDT(indval.Period3.sessile.df, keep.rownames = TRUE)[]
+
+#Get rid of non significant results.
+
+indval.Period3.sessile.df.filtered <- indval.Period3.sessile.df2[which(indval.Period3.sessile.df2$p.value < 0.05),]
+
+
+indval.Period3.sessile.df.filtered2 <- indval.Period3.sessile.df.filtered[which(indval.Period3.sessile.df.filtered$index < 6),]
+
+
+indval.Period3.sessile.summary <- indval.Period3.sessile.df.filtered2 %>% 
+                        group_by(index) %>% 
+                        summarise(count = length(index))
+
+
+otunames <- indval.Period3.sessile.df.filtered2$rn
+
+
+
+ 
+r <- rownames(tax_table(Period3.sessile.rare_perc)) %in% otunames
+
+imp.taxa <- as.data.frame(as.matrix(tax_table(Period3.sessile.rare_perc)[r, ]))
+  
+indicator.ps <- prune_taxa(as.character(otunames), Period3.sessile.rare_perc)
+
+indicator.ps1 <- filter_taxa(indicator.ps, function(x) sum(x > 0.5) >= (0.1*length(x)), TRUE)
+
+
+indicator.ps.melt <- psmelt(indicator.ps1)
+
+indicator.ps.melt.summary <- indicator.ps.melt %>%
+  group_by(OTU, Phylum, Class, Genus) %>%
+  summarise(mean= mean(Abundance))
+
+indicator.ps.melt.summary1 <- left_join(indicator.ps.melt.summary, indval.Period3.sessile.df.filtered2, by = c("OTU" = "rn"))
+
+indicator.ps.melt.summary2 <- indicator.ps.melt.summary1  %>% 
+                        group_by(index, Phylum, Class) %>% 
+                        summarise(count = length(index))
+
+indicator.ps.melt.summary3 <- indicator.ps.melt %>%
+  group_by(OTU, Class) %>%
+  summarise(mean= mean(Abundance))
+
+indicator.ps.melt.summary4 <- left_join(indicator.ps.melt.summary3, indval.Period3.sessile.df.filtered2, by = c("OTU" = "rn"))
+```
+
+
+
+```{r}
+devtools::source_gist("8d0ca4206a66be7ff6d76fc4ab8e66c6")
+
+
+tax.new <- data.frame(tax_table(indicator.ps1))
+
+tax.new <- rownames_to_column(tax.new)
+
+tax.new1 <- tax.new %>% unite("Species", Phylum, rowname, remove = FALSE) %>%
+  select(rowname,Kingdom, Phylum, Class, Order, Family, Genus, Species)
+
+tax.new1 <- column_to_rownames(tax.new1, var = "rowname")
+
+tax_table(indicator.ps1) <- as.matrix(tax.new1)
+
+
+
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 1] <- "CRS"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 2] <- "AG"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 3] <- "NRS"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 4] <- "OG"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 5] <- "SRS"
+
+
+
+indicator_ampvis2_obj <- phyloseq_to_ampvis2(indicator.ps1)
+
+
+indicator_ampvis2_obj$metadata$Region <- factor(indicator_ampvis2_obj$metadata$Region, levels = c("NRS", "CRS", "SRS", "OG", "AG"))
+
+
+
+indicator.heatmap_sessile <- amp_heatmap(data = indicator_ampvis2_obj, group_by = c("Region"), tax_aggregate = "Species", tax_show=40, 
+                                            tax_empty="best", normalise = FALSE, plot_values = FALSE, plot_colorscale = "log", min_abundance = 0.001, 
+                                            color_vector = c("gray93", "red"), plot_legendbreaks = c(0.005, 0.05, 0.5, 5), 
+                                 order_y_by = c("Porifera_ASV_183", "Arthropoda_ASV_4", "Arthropoda_ASV_13",
+                                                "Arthropoda_ASV_28", "Arthropoda_ASV_205", "Porifera_ASV_17", "Annelida_ASV_62",
+                 "Chordata_ASV_94", "Annelida_ASV_53", "Porifera_ASV_50", "Porifera_ASV_16",
+                 "Porifera_ASV_59", "Chordata_ASV_11", "Arthropoda_ASV_90", "Porifera_ASV_411", "Cnidaria_ASV_27", "Cnidaria_ASV_9", "Annelida_ASV_310", 
+                 "Porifera_ASV_608", "Porifera_ASV_170", "Arthropoda_ASV_76", "Chordata_ASV_195", "Mollusca_ASV_678", "Chordata_ASV_196"))  +
+  theme(axis.text.y=element_text(size=10, color="black", face="italic")) +
+  theme(axis.text.x=element_text(size=10, color="black")) +
+  theme(legend.text = element_text(size=10, color="black")) +
+  theme(legend.title = element_text(size=10, color="black")) +
+  theme(axis.title = element_text(size=10, color="black")) +
+  theme(plot.title = element_text(size=12, color="black")) +
+  xlab("Region") +
+  ylab("Indicator taxa")  +
+  ggtitle("B") 
+
+
+cairo_ps(file="~/Documents/Bioinformatics/ARMStemporal/indicator.heatmap_sessile.v1.eps", width=10, height=15, bg="transparent")
+indicator.heatmap_sessile
+dev.off()
+```
+
+
+#106 Indicators
+
+```{r}
+
+Period3.106.reef <- merge_samples(Period3.106, "Reef")
+
+taxanames <- taxa_names(Period3.106.rare_perc1)
+
+Period3.106.reef_filtered <- prune_taxa(as.character(taxanames), Period3.106.reef)
+
+
+
+
+#ASV table to proportion
+Period3.106.rare_perc = transform_sample_counts(Period3.106.reef_filtered, function(OTU) OTU/sum(OTU)*100)
+#Make dataframe
+Period3.106.rare_perc.df <- as.data.frame(otu_table(Period3.106.rare_perc))
+
+#Data frame of sample data
+Period3.106.rare_perc.sd <- as.data.frame(sample_data(Period3.106.rare_perc))
+
+#Period3.106.rare_perc.sd$Region <- rownames(Period3.106.rare_perc.sd)
+
+#Make it repeatable by setting seed
+
+set.seed(56)
+
+#Uses package indicspecies. Finds indicator species of each level within the factor (I ran this as depth as this is the level within each factor).
+indval.Period3.106 <- multipatt(Period3.106.rare_perc.df, Period3.106.rare_perc.sd$Region, control=how(nperm=999))
+
+#Output as a data frame
+
+indval.Period3.106.df <- as.data.frame(indval.Period3.106$sign)
+
+#Use data.table package to get rownames as a column (this can be done in dplyr as well as can the below steps. Probably easier now days to do it with dplyr).
+
+indval.Period3.106.df2 <- setDT(indval.Period3.106.df, keep.rownames = TRUE)[]
+
+#Get rid of non significant results.
+
+indval.Period3.106.df.filtered <- indval.Period3.106.df2[which(indval.Period3.106.df2$p.value < 0.05),]
+
+
+indval.Period3.106.df.filtered2 <- indval.Period3.106.df.filtered[which(indval.Period3.106.df.filtered$index < 6),]
+
+
+indval.Period3.106.summary <- indval.Period3.106.df.filtered2 %>% 
+                        group_by(index) %>% 
+                        summarise(count = length(index))
+
+
+otunames <- indval.Period3.106.df.filtered2$rn
+
+
+
+ 
+r <- rownames(tax_table(Period3.106.rare_perc)) %in% otunames
+
+imp.taxa <- as.data.frame(as.matrix(tax_table(Period3.106.rare_perc)[r, ]))
+  
+indicator.ps <- prune_taxa(as.character(otunames), Period3.106.rare_perc)
+
+indicator.ps1 <- filter_taxa(indicator.ps, function(x) sum(x > 0.5) >= (0.1*length(x)), TRUE)
+
+
+indicator.ps.melt <- psmelt(indicator.ps1)
+
+indicator.ps.melt.summary <- indicator.ps.melt %>%
+  group_by(OTU, Phylum, Class, Genus) %>%
+  summarise(mean= mean(Abundance))
+
+indicator.ps.melt.summary1 <- left_join(indicator.ps.melt.summary, indval.Period3.106.df.filtered2, by = c("OTU" = "rn"))
+
+indicator.ps.melt.summary2 <- indicator.ps.melt.summary1  %>% 
+                        group_by(index, Phylum, Class) %>% 
+                        summarise(count = length(index))
+
+indicator.ps.melt.summary3 <- indicator.ps.melt %>%
+  group_by(OTU, Class) %>%
+  summarise(mean= mean(Abundance))
+
+indicator.ps.melt.summary4 <- left_join(indicator.ps.melt.summary3, indval.Period3.106.df.filtered2, by = c("OTU" = "rn"))
+```
+
+
+
+```{r}
+devtools::source_gist("8d0ca4206a66be7ff6d76fc4ab8e66c6")
+
+
+tax.new <- data.frame(tax_table(indicator.ps1))
+
+tax.new <- rownames_to_column(tax.new)
+
+tax.new1 <- tax.new %>% unite("Species", Phylum, rowname, remove = FALSE) %>%
+  select(rowname,Kingdom, Phylum, Class, Order, Family, Genus, Species)
+
+tax.new1 <- column_to_rownames(tax.new1, var = "rowname")
+
+tax_table(indicator.ps1) <- as.matrix(tax.new1)
+
+
+
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 1] <- "CRS"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 2] <- "AG"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 3] <- "NRS"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 4] <- "OG"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 5] <- "SRS"
+
+
+
+indicator_ampvis2_obj <- phyloseq_to_ampvis2(indicator.ps1)
+
+
+indicator_ampvis2_obj$metadata$Region <- factor(indicator_ampvis2_obj$metadata$Region, levels = c("NRS", "CRS", "SRS", "OG", "AG"))
+
+
+
+
+
+
+indicator.heatmap_106 <- amp_heatmap(data = indicator_ampvis2_obj, group_by = c("Region"), tax_aggregate = "Species", tax_show=40, 
+                                            tax_empty="best", normalise = FALSE, plot_values = FALSE, plot_colorscale = "log", min_abundance = 0.001, 
+                                            color_vector = c("gray93", "red"), plot_legendbreaks = c(0.005, 0.05, 0.5, 5), 
+                                 order_y_by = c("Annelida_ASV_66", "Arthropoda_ASV_399", "Arthropoda_ASV_205", "Arthropoda_ASV_184", "Arthropoda_ASV_250", 
+                                                "Arthropoda_ASV_120", "Arthropoda_ASV_28", "Arthropoda_ASV_4", "Arthropoda_ASV_13", "Annelida_ASV_62",
+                                                "Arthropoda_ASV_245", "Annelida_ASV_53", "Arthropoda_ASV_311",  "Porifera_ASV_208", "Chordata_ASV_22", 
+                                                "Porifera_ASV_19", "Porifera_ASV_1", "Porifera_ASV_16", "Arthropoda_ASV_7", "Chordata_ASV_20", 
+                                                "Chordata_ASV_157", "Chordata_ASV_196", "Arthropoda_ASV_340",  "Arthropoda_ASV_783", "Arthropoda_ASV_392",
+                                                "Chordata_ASV_267", "Arthropoda_ASV_601"))  +
+  theme(axis.text.y=element_text(size=10, color="black", face="italic")) +
+  theme(axis.text.x=element_text(size=10, color="black")) +
+  theme(legend.text = element_text(size=10, color="black")) +
+  theme(legend.title = element_text(size=10, color="black")) +
+  theme(axis.title = element_text(size=10, color="black")) +
+  theme(plot.title = element_text(size=12, color="black")) +
+  xlab("Region") +
+  ylab("Indicator taxa")  +
+  ggtitle("D") 
+
+
+
+```
+
+
+
+
+#500 Indicators
+
+
+```{r}
+
+Period3.500.reef <- merge_samples(Period3.500, "Reef")
+
+taxanames <- taxa_names(Period3.500.rare_perc1)
+
+Period3.500.reef_filtered <- prune_taxa(as.character(taxanames), Period3.500.reef)
+
+
+
+
+#ASV table to proportion
+Period3.500.rare_perc = transform_sample_counts(Period3.500.reef_filtered, function(OTU) OTU/sum(OTU)*100)
+#Make dataframe
+Period3.500.rare_perc.df <- as.data.frame(otu_table(Period3.500.rare_perc))
+
+#Data frame of sample data
+Period3.500.rare_perc.sd <- as.data.frame(sample_data(Period3.500.rare_perc))
+
+#Period3.500.rare_perc.sd$Region <- rownames(Period3.500.rare_perc.sd)
+
+#Make it repeatable by setting seed
+
+set.seed(56)
+
+#Uses package indicspecies. Finds indicator species of each level within the factor (I ran this as depth as this is the level within each factor).
+indval.Period3.500 <- multipatt(Period3.500.rare_perc.df, Period3.500.rare_perc.sd$Region, control=how(nperm=999))
+
+#Output as a data frame
+
+indval.Period3.500.df <- as.data.frame(indval.Period3.500$sign)
+
+#Use data.table package to get rownames as a column (this can be done in dplyr as well as can the below steps. Probably easier now days to do it with dplyr).
+
+indval.Period3.500.df2 <- setDT(indval.Period3.500.df, keep.rownames = TRUE)[]
+
+#Get rid of non significant results.
+
+indval.Period3.500.df.filtered <- indval.Period3.500.df2[which(indval.Period3.500.df2$p.value < 0.05),]
+
+
+indval.Period3.500.df.filtered2 <- indval.Period3.500.df.filtered[which(indval.Period3.500.df.filtered$index < 6),]
+
+
+indval.Period3.500.summary <- indval.Period3.500.df.filtered2 %>% 
+                        group_by(index) %>% 
+                        summarise(count = length(index))
+
+
+otunames <- indval.Period3.500.df.filtered2$rn
+
+
+
+ 
+r <- rownames(tax_table(Period3.500.rare_perc)) %in% otunames
+
+imp.taxa <- as.data.frame(as.matrix(tax_table(Period3.500.rare_perc)[r, ]))
+  
+indicator.ps <- prune_taxa(as.character(otunames), Period3.500.rare_perc)
+
+indicator.ps1 <- filter_taxa(indicator.ps, function(x) sum(x > 0.5) >= (0.1*length(x)), TRUE)
+
+
+indicator.ps.melt <- psmelt(indicator.ps1)
+
+indicator.ps.melt.summary <- indicator.ps.melt %>%
+  group_by(OTU, Phylum, Class, Genus) %>%
+  summarise(mean= mean(Abundance))
+
+indicator.ps.melt.summary1 <- left_join(indicator.ps.melt.summary, indval.Period3.500.df.filtered2, by = c("OTU" = "rn"))
+
+indicator.ps.melt.summary2 <- indicator.ps.melt.summary1  %>% 
+                        group_by(index, Phylum, Class) %>% 
+                        summarise(count = length(index))
+
+indicator.ps.melt.summary3 <- indicator.ps.melt %>%
+  group_by(OTU, Class) %>%
+  summarise(mean= mean(Abundance))
+
+indicator.ps.melt.summary4 <- left_join(indicator.ps.melt.summary3, indval.Period3.500.df.filtered2, by = c("OTU" = "rn"))
+```
+
+
+
+```{r}
+devtools::source_gist("8d0ca4206a66be7ff6d76fc4ab8e66c6")
+
+
+tax.new <- data.frame(tax_table(indicator.ps1))
+
+tax.new <- rownames_to_column(tax.new)
+
+tax.new1 <- tax.new %>% unite("Species", Phylum, rowname, remove = FALSE) %>%
+  select(rowname,Kingdom, Phylum, Class, Order, Family, Genus, Species)
+
+tax.new1 <- column_to_rownames(tax.new1, var = "rowname")
+
+tax_table(indicator.ps1) <- as.matrix(tax.new1)
+
+
+
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 1] <- "CRS"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 2] <- "AG"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 3] <- "NRS"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 4] <- "OG"
+sample_data(indicator.ps1)$Region[sample_data(indicator.ps1)$Region == 5] <- "SRS"
+
+
+
+indicator_ampvis2_obj <- phyloseq_to_ampvis2(indicator.ps1)
+
+
+indicator_ampvis2_obj$metadata$Region <- factor(indicator_ampvis2_obj$metadata$Region, levels = c("NRS", "CRS", "SRS", "OG", "AG"))
+
+
+indicator.heatmap_500 <- amp_heatmap(data = indicator_ampvis2_obj, group_by = c("Region"), tax_aggregate = "Species", tax_show=40, 
+                                            tax_empty="best", normalise = FALSE, plot_values = FALSE, plot_colorscale = "log", min_abundance = 0.001, 
+                                            color_vector = c("gray93", "red"), plot_legendbreaks = c(0.005, 0.05, 0.5, 5),  
+                                 order_y_by = c("Arthropoda_ASV_205", "Arthropoda_ASV_265", "Arthropoda_ASV_120", "Arthropoda_ASV_28", "Arthropoda_ASV_4",
+                                                "Arthropoda_ASV_123", "Annelida_ASV_486", "Echinodermata_ASV_477", "Echinodermata_ASV_581", "Annelida_ASV_53",
+                                                "Annelida_ASV_92", "Arthropoda_ASV_90", "Annelida_ASV_137", "Arthropoda_ASV_176", "Arthropoda_ASV_152", "Annelida_ASV_154", 
+                                                "Porifera_ASV_16", "Annelida_ASV_42",  "Arthropoda_ASV_111"))  +
+  theme(axis.text.y=element_text(size=10, color="black", face="italic")) +
+  theme(axis.text.x=element_text(size=10, color="black")) +
+  theme(legend.text = element_text(size=10, color="black")) +
+  theme(legend.title = element_text(size=10, color="black")) +
+  theme(axis.title = element_text(size=10, color="black")) +
+  theme(plot.title = element_text(size=12, color="black")) +
+  xlab("Region") +
+  ylab("Indicator taxa")  +
+  ggtitle("F") 
+
+
+
+```
+
+
+#Overall Network/Indicator Plot
+
+```{r}
+
+my_plot_sessile <- ggplot() +
+  theme(panel.background = element_rect(fill="transparent"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill="transparent", colour=NA),
+        legend.background = element_rect(fill="transparent"),
+        legend.key = element_rect(fill = NA)) +
+  ggtitle("A")+
+  theme(plot.title = element_text(size=12, color="black", vjust= 2.5))
+
+network.plot_sessile <- ggdraw() +
+  draw_plot(my_plot_sessile) +
+  draw_image("~/Documents/Bioinformatics/ARMStemporal/sessile_network.v1.png") 
+```
+
+
+```{r}
+
+my_plot_106 <- ggplot() +
+  theme(panel.background = element_rect(fill="transparent"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill="transparent", colour=NA),
+        legend.background = element_rect(fill="transparent"),
+        legend.key = element_rect(fill = NA)) +
+  ggtitle("C")+
+  theme(plot.title = element_text(size=12, color="black", vjust= 2.5))
+
+network.plot_106 <- ggdraw() +
+  draw_plot(my_plot_106) +
+  draw_image("~/Documents/Bioinformatics/ARMStemporal/network_106.v1.png") 
+```
+
+
+
+```{r}
+
+my_plot_500 <- ggplot() +
+  theme(panel.background = element_rect(fill="transparent"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill="transparent", colour=NA),
+        legend.background = element_rect(fill="transparent"),
+        legend.key = element_rect(fill = NA)) +
+  ggtitle("E")+
+  theme(plot.title = element_text(size=12, color="black", vjust= 2.5))
+
+network.plot_500 <- ggdraw() +
+  draw_plot(my_plot_500) +
+  draw_image("~/Documents/Bioinformatics/ARMStemporal/network_500.v1.png") 
+```
+
+
+```{r}
+library(cowplot)
+network.heatmap_combined <- plot_grid(network.plot_sessile, indicator.heatmap_sessile, 
+                                      network.plot_106, indicator.heatmap_106,
+                                      network.plot_500, indicator.heatmap_500,
+                                      rel_widths = c(1, 1.5), ncol = 2, nrow = 3)
+
+library(grid)
+
+
+cairo_ps(file="~/Documents/Bioinformatics/ARMStemporal/network.indicator.v1.eps", width=10, height=15, bg="transparent")
+network.heatmap_combined
+dev.off()
+```
+
+
+
+#Shared Sessile
+
+```{r}
+Period3.sessile.rare
+
+sample_data(Period3.sessile.rare)$Region <- sample_names(Period3.sessile.rare)
+
+count.sep <- estimate_richness(Period3.sessile.rare, measures="Observed")
+
+
+North.Central = subset_samples(Period3.sessile.rare, Region == "North" | Region == "Central")
+North.South = subset_samples(Period3.sessile.rare, Region == "North" | Region == "South")
+North.Gulf = subset_samples(Period3.sessile.rare, Region == "North" | Region == "Gulf")
+North.Oman = subset_samples(Period3.sessile.rare, Region == "North" | Region == "Oman")
+Central.South = subset_samples(Period3.sessile.rare, Region == "Central" | Region == "South")
+Central.Gulf = subset_samples(Period3.sessile.rare, Region == "Central" | Region == "Gulf")
+Central.Oman = subset_samples(Period3.sessile.rare, Region == "Central" | Region == "Oman")
+South.Gulf = subset_samples(Period3.sessile.rare, Region == "South" | Region == "Gulf")
+South.Oman = subset_samples(Period3.sessile.rare, Region == "South" | Region == "Oman")
+Gulf.Oman = subset_samples(Period3.sessile.rare, Region == "Gulf" | Region == "Oman")
+
+```
+
+
+
+```{r}
+shared.North.Central = filter_taxa(North.Central, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.South = filter_taxa(North.South, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.Gulf = filter_taxa(North.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.Oman = filter_taxa(North.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.South = filter_taxa(Central.South, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.Gulf = filter_taxa(Central.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.Oman = filter_taxa(Central.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.South.Gulf = filter_taxa(South.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.South.Oman = filter_taxa(South.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.Gulf.Oman = filter_taxa(Gulf.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.all = filter_taxa(Period3.sessile.rare, function(x) sum(x >= 1) == (5), TRUE)
+
+```
+
+
+```{r}
+taxa.North.Central <- as.data.frame(tax_table(shared.North.Central), stringsAsFactors=FALSE)
+taxa.North.South <- as.data.frame(tax_table(shared.North.South), stringsAsFactors=FALSE)
+taxa.North.Gulf <- as.data.frame(tax_table(shared.North.Gulf), stringsAsFactors=FALSE)
+taxa.North.Oman <- as.data.frame(tax_table(shared.North.Oman), stringsAsFactors=FALSE)
+taxa.Central.South <- as.data.frame(tax_table(shared.Central.South), stringsAsFactors=FALSE)
+taxa.Central.Gulf <- as.data.frame(tax_table(shared.Central.Gulf), stringsAsFactors=FALSE)
+taxa.Central.Oman <- as.data.frame(tax_table(shared.Central.Oman), stringsAsFactors=FALSE)
+taxa.South.Gulf <- as.data.frame(tax_table(shared.South.Gulf), stringsAsFactors=FALSE)
+taxa.South.Oman <- as.data.frame(tax_table(shared.South.Oman), stringsAsFactors=FALSE)
+taxa.Gulf.Oman <- as.data.frame(tax_table(shared.Gulf.Oman), stringsAsFactors=FALSE)
+
+```
+
+
+
+
+```{r}
+sample_data(shared.North.Central)$Fraction[sample_data(shared.North.Central)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.South)$Fraction[sample_data(shared.North.South)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.Gulf)$Fraction[sample_data(shared.North.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.Oman)$Fraction[sample_data(shared.North.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.South)$Fraction[sample_data(shared.Central.South)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.Gulf)$Fraction[sample_data(shared.Central.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.Oman)$Fraction[sample_data(shared.Central.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.South.Gulf)$Fraction[sample_data(shared.South.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.South.Oman)$Fraction[sample_data(shared.South.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.Gulf.Oman)$Fraction[sample_data(shared.Gulf.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.all)$Fraction[sample_data(shared.all)$Fraction == 1] <- "ARMS"
+
+shared.North.Central.merged <- merge_samples(shared.North.Central, "Fraction", fun=mean)
+shared.North.South.merged <- merge_samples(shared.North.South, "Fraction", fun=mean)
+shared.North.Gulf.merged <- merge_samples(shared.North.Gulf, "Fraction", fun=mean)
+shared.North.Oman.merged <- merge_samples(shared.North.Oman, "Fraction", fun=mean)
+shared.Central.South.merged <- merge_samples(shared.Central.South, "Fraction", fun=mean)
+shared.Central.Gulf.merged <- merge_samples(shared.Central.Gulf, "Fraction", fun=mean)
+shared.Central.Oman.merged <- merge_samples(shared.Central.Oman, "Fraction", fun=mean)
+shared.South.Gulf.merged <- merge_samples(shared.South.Gulf, "Fraction", fun=mean)
+shared.South.Oman.merged <- merge_samples(shared.South.Oman, "Fraction", fun=mean)
+shared.Gulf.Oman.merged <- merge_samples(shared.Gulf.Oman, "Fraction", fun=mean)
+shared.all.merged <- merge_samples(shared.all, "Fraction", fun=mean)
+
+count.North.Central <- estimate_richness(shared.North.Central.merged, measures="Observed")
+count.North.South <- estimate_richness(shared.North.South.merged, measures="Observed")
+count.North.Gulf <- estimate_richness(shared.North.Gulf.merged, measures="Observed")
+count.North.Oman <- estimate_richness(shared.North.Oman.merged, measures="Observed")
+count.Central.South <- estimate_richness(shared.Central.South.merged, measures="Observed")
+count.Central.Gulf <- estimate_richness(shared.Central.Gulf.merged, measures="Observed")
+count.Central.Oman <- estimate_richness(shared.Central.Oman.merged, measures="Observed")
+count.South.Gulf <- estimate_richness(shared.South.Gulf.merged, measures="Observed")
+count.South.Oman <- estimate_richness(shared.South.Oman.merged, measures="Observed")
+count.Gulf.Oman <- estimate_richness(shared.Gulf.Oman.merged, measures="Observed")
+count.all <- estimate_richness(shared.all.merged, measures="Observed")
+
+count.sep <- t(count.sep)
+count.North.Central <- t(count.North.Central)
+count.North.South <- t(count.North.South)
+count.North.Gulf <- t(count.North.Gulf)
+count.North.Oman <- t(count.North.Oman)
+count.Central.South <- t(count.Central.South)
+count.Central.Gulf <- t(count.Central.Gulf)
+count.Central.Oman <- t(count.Central.Oman)
+count.South.Gulf <- t(count.South.Gulf)
+count.South.Oman <- t(count.South.Oman)
+count.Gulf.Oman <- t(count.Gulf.Oman)
+count.all <- t(count.all)
+
+colnames(count.North.Central) <- "North.Central"
+colnames(count.North.South) <- "North.South"
+colnames(count.North.Gulf) <- "North.Gulf"
+colnames(count.North.Oman) <- "North.Oman"
+colnames(count.Central.South) <- "Central.South"
+colnames(count.Central.Gulf) <- "Central.Gulf"
+colnames(count.Central.Oman) <- "Central.Oman"
+colnames(count.South.Gulf) <- "South.Gulf"
+colnames(count.South.Oman) <- "South.Oman"
+colnames(count.Gulf.Oman) <- "Gulf.Oman"
+colnames(count.all) <- "All"
+
+
+shared.otus.sessile <- as.data.frame(cbind(count.sep, 
+                                   count.North.Central, 
+                                   count.North.South, 
+                                   count.North.Gulf, 
+                                   count.North.Oman,
+                                   count.Central.South,
+                                   count.Central.Gulf,
+                                   count.Central.Oman,
+                                   count.South.Gulf,
+                                   count.South.Oman,
+                                   count.Gulf.Oman,
+                                   count.all))
+
+shared.otus.sessile <- as.data.frame(t(shared.otus.sessile))
+
+
+shared.otus.sessile$prop.gamma <- shared.otus.sessile$Observed/27099*100
+```
+
+
+
+#Shared 106
+
+
+
+```{r}
+Period3.106.rare
+
+sample_data(Period3.106.rare)$Region <- sample_names(Period3.106.rare)
+
+count.sep <- estimate_richness(Period3.106.rare, measures="Observed")
+
+
+North.Central = subset_samples(Period3.106.rare, Region == "North" | Region == "Central")
+North.South = subset_samples(Period3.106.rare, Region == "North" | Region == "South")
+North.Gulf = subset_samples(Period3.106.rare, Region == "North" | Region == "Gulf")
+North.Oman = subset_samples(Period3.106.rare, Region == "North" | Region == "Oman")
+Central.South = subset_samples(Period3.106.rare, Region == "Central" | Region == "South")
+Central.Gulf = subset_samples(Period3.106.rare, Region == "Central" | Region == "Gulf")
+Central.Oman = subset_samples(Period3.106.rare, Region == "Central" | Region == "Oman")
+South.Gulf = subset_samples(Period3.106.rare, Region == "South" | Region == "Gulf")
+South.Oman = subset_samples(Period3.106.rare, Region == "South" | Region == "Oman")
+Gulf.Oman = subset_samples(Period3.106.rare, Region == "Gulf" | Region == "Oman")
+
+```
+
+
+
+```{r}
+shared.North.Central = filter_taxa(North.Central, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.South = filter_taxa(North.South, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.Gulf = filter_taxa(North.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.Oman = filter_taxa(North.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.South = filter_taxa(Central.South, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.Gulf = filter_taxa(Central.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.Oman = filter_taxa(Central.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.South.Gulf = filter_taxa(South.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.South.Oman = filter_taxa(South.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.Gulf.Oman = filter_taxa(Gulf.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.all = filter_taxa(Period3.106.rare, function(x) sum(x >= 1) == (5), TRUE)
+
+```
+
+
+```{r}
+taxa.North.Central <- as.data.frame(tax_table(shared.North.Central), stringsAsFactors=FALSE)
+taxa.North.South <- as.data.frame(tax_table(shared.North.South), stringsAsFactors=FALSE)
+taxa.North.Gulf <- as.data.frame(tax_table(shared.North.Gulf), stringsAsFactors=FALSE)
+taxa.North.Oman <- as.data.frame(tax_table(shared.North.Oman), stringsAsFactors=FALSE)
+taxa.Central.South <- as.data.frame(tax_table(shared.Central.South), stringsAsFactors=FALSE)
+taxa.Central.Gulf <- as.data.frame(tax_table(shared.Central.Gulf), stringsAsFactors=FALSE)
+taxa.Central.Oman <- as.data.frame(tax_table(shared.Central.Oman), stringsAsFactors=FALSE)
+taxa.South.Gulf <- as.data.frame(tax_table(shared.South.Gulf), stringsAsFactors=FALSE)
+taxa.South.Oman <- as.data.frame(tax_table(shared.South.Oman), stringsAsFactors=FALSE)
+taxa.Gulf.Oman <- as.data.frame(tax_table(shared.Gulf.Oman), stringsAsFactors=FALSE)
+
+```
+
+
+
+
+```{r}
+sample_data(shared.North.Central)$Fraction[sample_data(shared.North.Central)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.South)$Fraction[sample_data(shared.North.South)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.Gulf)$Fraction[sample_data(shared.North.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.Oman)$Fraction[sample_data(shared.North.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.South)$Fraction[sample_data(shared.Central.South)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.Gulf)$Fraction[sample_data(shared.Central.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.Oman)$Fraction[sample_data(shared.Central.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.South.Gulf)$Fraction[sample_data(shared.South.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.South.Oman)$Fraction[sample_data(shared.South.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.Gulf.Oman)$Fraction[sample_data(shared.Gulf.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.all)$Fraction[sample_data(shared.all)$Fraction == 1] <- "ARMS"
+
+shared.North.Central.merged <- merge_samples(shared.North.Central, "Fraction", fun=mean)
+shared.North.South.merged <- merge_samples(shared.North.South, "Fraction", fun=mean)
+shared.North.Gulf.merged <- merge_samples(shared.North.Gulf, "Fraction", fun=mean)
+shared.North.Oman.merged <- merge_samples(shared.North.Oman, "Fraction", fun=mean)
+shared.Central.South.merged <- merge_samples(shared.Central.South, "Fraction", fun=mean)
+shared.Central.Gulf.merged <- merge_samples(shared.Central.Gulf, "Fraction", fun=mean)
+shared.Central.Oman.merged <- merge_samples(shared.Central.Oman, "Fraction", fun=mean)
+shared.South.Gulf.merged <- merge_samples(shared.South.Gulf, "Fraction", fun=mean)
+shared.South.Oman.merged <- merge_samples(shared.South.Oman, "Fraction", fun=mean)
+shared.Gulf.Oman.merged <- merge_samples(shared.Gulf.Oman, "Fraction", fun=mean)
+shared.all.merged <- merge_samples(shared.all, "Fraction", fun=mean)
+
+count.North.Central <- estimate_richness(shared.North.Central.merged, measures="Observed")
+count.North.South <- estimate_richness(shared.North.South.merged, measures="Observed")
+count.North.Gulf <- estimate_richness(shared.North.Gulf.merged, measures="Observed")
+count.North.Oman <- estimate_richness(shared.North.Oman.merged, measures="Observed")
+count.Central.South <- estimate_richness(shared.Central.South.merged, measures="Observed")
+count.Central.Gulf <- estimate_richness(shared.Central.Gulf.merged, measures="Observed")
+count.Central.Oman <- estimate_richness(shared.Central.Oman.merged, measures="Observed")
+count.South.Gulf <- estimate_richness(shared.South.Gulf.merged, measures="Observed")
+count.South.Oman <- estimate_richness(shared.South.Oman.merged, measures="Observed")
+count.Gulf.Oman <- estimate_richness(shared.Gulf.Oman.merged, measures="Observed")
+count.all <- estimate_richness(shared.all.merged, measures="Observed")
+
+count.sep <- t(count.sep)
+count.North.Central <- t(count.North.Central)
+count.North.South <- t(count.North.South)
+count.North.Gulf <- t(count.North.Gulf)
+count.North.Oman <- t(count.North.Oman)
+count.Central.South <- t(count.Central.South)
+count.Central.Gulf <- t(count.Central.Gulf)
+count.Central.Oman <- t(count.Central.Oman)
+count.South.Gulf <- t(count.South.Gulf)
+count.South.Oman <- t(count.South.Oman)
+count.Gulf.Oman <- t(count.Gulf.Oman)
+count.all <- t(count.all)
+
+colnames(count.North.Central) <- "North.Central"
+colnames(count.North.South) <- "North.South"
+colnames(count.North.Gulf) <- "North.Gulf"
+colnames(count.North.Oman) <- "North.Oman"
+colnames(count.Central.South) <- "Central.South"
+colnames(count.Central.Gulf) <- "Central.Gulf"
+colnames(count.Central.Oman) <- "Central.Oman"
+colnames(count.South.Gulf) <- "South.Gulf"
+colnames(count.South.Oman) <- "South.Oman"
+colnames(count.Gulf.Oman) <- "Gulf.Oman"
+colnames(count.all) <- "All"
+
+
+shared.otus.106 <- as.data.frame(cbind(count.sep, 
+                                   count.North.Central, 
+                                   count.North.South, 
+                                   count.North.Gulf, 
+                                   count.North.Oman,
+                                   count.Central.South,
+                                   count.Central.Gulf,
+                                   count.Central.Oman,
+                                   count.South.Gulf,
+                                   count.South.Oman,
+                                   count.Gulf.Oman,
+                                   count.all))
+
+shared.otus.106 <- as.data.frame(t(shared.otus.106))
+
+
+shared.otus.106$prop.gamma <- shared.otus.106$Observed/41643*100
+```
+
+
+#Shared 500
+
+
+```{r}
+Period3.500.rare
+
+sample_data(Period3.500.rare)$Region <- sample_names(Period3.500.rare)
+
+count.sep <- estimate_richness(Period3.500.rare, measures="Observed")
+
+
+North.Central = subset_samples(Period3.500.rare, Region == "North" | Region == "Central")
+North.South = subset_samples(Period3.500.rare, Region == "North" | Region == "South")
+North.Gulf = subset_samples(Period3.500.rare, Region == "North" | Region == "Gulf")
+North.Oman = subset_samples(Period3.500.rare, Region == "North" | Region == "Oman")
+Central.South = subset_samples(Period3.500.rare, Region == "Central" | Region == "South")
+Central.Gulf = subset_samples(Period3.500.rare, Region == "Central" | Region == "Gulf")
+Central.Oman = subset_samples(Period3.500.rare, Region == "Central" | Region == "Oman")
+South.Gulf = subset_samples(Period3.500.rare, Region == "South" | Region == "Gulf")
+South.Oman = subset_samples(Period3.500.rare, Region == "South" | Region == "Oman")
+Gulf.Oman = subset_samples(Period3.500.rare, Region == "Gulf" | Region == "Oman")
+
+```
+
+
+
+```{r}
+shared.North.Central = filter_taxa(North.Central, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.South = filter_taxa(North.South, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.Gulf = filter_taxa(North.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.North.Oman = filter_taxa(North.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.South = filter_taxa(Central.South, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.Gulf = filter_taxa(Central.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.Central.Oman = filter_taxa(Central.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.South.Gulf = filter_taxa(South.Gulf, function(x) sum(x >= 1) == (2), TRUE)
+shared.South.Oman = filter_taxa(South.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.Gulf.Oman = filter_taxa(Gulf.Oman, function(x) sum(x >= 1) == (2), TRUE)
+shared.all = filter_taxa(Period3.500.rare, function(x) sum(x >= 1) == (5), TRUE)
+
+```
+
+
+```{r}
+taxa.North.Central <- as.data.frame(tax_table(shared.North.Central), stringsAsFactors=FALSE)
+taxa.North.South <- as.data.frame(tax_table(shared.North.South), stringsAsFactors=FALSE)
+taxa.North.Gulf <- as.data.frame(tax_table(shared.North.Gulf), stringsAsFactors=FALSE)
+taxa.North.Oman <- as.data.frame(tax_table(shared.North.Oman), stringsAsFactors=FALSE)
+taxa.Central.South <- as.data.frame(tax_table(shared.Central.South), stringsAsFactors=FALSE)
+taxa.Central.Gulf <- as.data.frame(tax_table(shared.Central.Gulf), stringsAsFactors=FALSE)
+taxa.Central.Oman <- as.data.frame(tax_table(shared.Central.Oman), stringsAsFactors=FALSE)
+taxa.South.Gulf <- as.data.frame(tax_table(shared.South.Gulf), stringsAsFactors=FALSE)
+taxa.South.Oman <- as.data.frame(tax_table(shared.South.Oman), stringsAsFactors=FALSE)
+taxa.Gulf.Oman <- as.data.frame(tax_table(shared.Gulf.Oman), stringsAsFactors=FALSE)
+
+```
+
+
+
+
+```{r}
+sample_data(shared.North.Central)$Fraction[sample_data(shared.North.Central)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.South)$Fraction[sample_data(shared.North.South)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.Gulf)$Fraction[sample_data(shared.North.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.North.Oman)$Fraction[sample_data(shared.North.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.South)$Fraction[sample_data(shared.Central.South)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.Gulf)$Fraction[sample_data(shared.Central.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.Central.Oman)$Fraction[sample_data(shared.Central.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.South.Gulf)$Fraction[sample_data(shared.South.Gulf)$Fraction == 1] <- "ARMS"
+sample_data(shared.South.Oman)$Fraction[sample_data(shared.South.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.Gulf.Oman)$Fraction[sample_data(shared.Gulf.Oman)$Fraction == 1] <- "ARMS"
+sample_data(shared.all)$Fraction[sample_data(shared.all)$Fraction == 1] <- "ARMS"
+
+shared.North.Central.merged <- merge_samples(shared.North.Central, "Fraction", fun=mean)
+shared.North.South.merged <- merge_samples(shared.North.South, "Fraction", fun=mean)
+shared.North.Gulf.merged <- merge_samples(shared.North.Gulf, "Fraction", fun=mean)
+shared.North.Oman.merged <- merge_samples(shared.North.Oman, "Fraction", fun=mean)
+shared.Central.South.merged <- merge_samples(shared.Central.South, "Fraction", fun=mean)
+shared.Central.Gulf.merged <- merge_samples(shared.Central.Gulf, "Fraction", fun=mean)
+shared.Central.Oman.merged <- merge_samples(shared.Central.Oman, "Fraction", fun=mean)
+shared.South.Gulf.merged <- merge_samples(shared.South.Gulf, "Fraction", fun=mean)
+shared.South.Oman.merged <- merge_samples(shared.South.Oman, "Fraction", fun=mean)
+shared.Gulf.Oman.merged <- merge_samples(shared.Gulf.Oman, "Fraction", fun=mean)
+shared.all.merged <- merge_samples(shared.all, "Fraction", fun=mean)
+
+count.North.Central <- estimate_richness(shared.North.Central.merged, measures="Observed")
+count.North.South <- estimate_richness(shared.North.South.merged, measures="Observed")
+count.North.Gulf <- estimate_richness(shared.North.Gulf.merged, measures="Observed")
+count.North.Oman <- estimate_richness(shared.North.Oman.merged, measures="Observed")
+count.Central.South <- estimate_richness(shared.Central.South.merged, measures="Observed")
+count.Central.Gulf <- estimate_richness(shared.Central.Gulf.merged, measures="Observed")
+count.Central.Oman <- estimate_richness(shared.Central.Oman.merged, measures="Observed")
+count.South.Gulf <- estimate_richness(shared.South.Gulf.merged, measures="Observed")
+count.South.Oman <- estimate_richness(shared.South.Oman.merged, measures="Observed")
+count.Gulf.Oman <- estimate_richness(shared.Gulf.Oman.merged, measures="Observed")
+count.all <- estimate_richness(shared.all.merged, measures="Observed")
+
+count.sep <- t(count.sep)
+count.North.Central <- t(count.North.Central)
+count.North.South <- t(count.North.South)
+count.North.Gulf <- t(count.North.Gulf)
+count.North.Oman <- t(count.North.Oman)
+count.Central.South <- t(count.Central.South)
+count.Central.Gulf <- t(count.Central.Gulf)
+count.Central.Oman <- t(count.Central.Oman)
+count.South.Gulf <- t(count.South.Gulf)
+count.South.Oman <- t(count.South.Oman)
+count.Gulf.Oman <- t(count.Gulf.Oman)
+count.all <- t(count.all)
+
+colnames(count.North.Central) <- "North.Central"
+colnames(count.North.South) <- "North.South"
+colnames(count.North.Gulf) <- "North.Gulf"
+colnames(count.North.Oman) <- "North.Oman"
+colnames(count.Central.South) <- "Central.South"
+colnames(count.Central.Gulf) <- "Central.Gulf"
+colnames(count.Central.Oman) <- "Central.Oman"
+colnames(count.South.Gulf) <- "South.Gulf"
+colnames(count.South.Oman) <- "South.Oman"
+colnames(count.Gulf.Oman) <- "Gulf.Oman"
+colnames(count.all) <- "All"
+
+
+shared.otus.500 <- as.data.frame(cbind(count.sep, 
+                                   count.North.Central, 
+                                   count.North.South, 
+                                   count.North.Gulf, 
+                                   count.North.Oman,
+                                   count.Central.South,
+                                   count.Central.Gulf,
+                                   count.Central.Oman,
+                                   count.South.Gulf,
+                                   count.South.Oman,
+                                   count.Gulf.Oman,
+                                   count.all))
+
+shared.otus.500 <- as.data.frame(t(shared.otus.500))
+
+
+shared.otus.500$prop.gamma <- shared.otus.500$Observed/28295*100
+```
+
+
+#Composition
+
+
+```{r}
+
+
+tax.clean <- data.frame(tax_table(Period3))
+
+for (i in 1:6){ tax.clean[,i] <- as.character(tax.clean[,i])}
+
+tax.clean[is.na(tax.clean)] <- ""
+
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,2] == ""){
+    kingdom <- paste("Unclassified_Kingdom_", tax.clean[i,1], sep = "")
+    tax.clean[i, 2:6] <- kingdom
+  } else if (tax.clean[i,3] == ""){
+    phylum <- paste("Unclassified_Phylum_", tax.clean[i,2], sep = "")
+    tax.clean[i, 3:6] <- phylum
+  } else if (tax.clean[i,4] == ""){
+    class <- paste("Unclassified_Class_", tax.clean[i,3], sep = "")
+    tax.clean[i, 4:6] <- class
+  } else if (tax.clean[i,5] == ""){
+    order <- paste("Unclassified_Order_", tax.clean[i,4], sep = "")
+    tax.clean[i, 5:6] <- order
+  } else if (tax.clean[i,6] == ""){
+    tax.clean$Genus[i] <- paste("Unclassified_Family",tax.clean$Family[i], sep = "_")
+  } 
+}
+
+tax_table(Period3) <- as.matrix(tax.clean)
+```
+
+
+
+
+```{r}
+
+sd <- as.data.frame(as.matrix(sample_data(Period3)))
+
+sd <- sd%>%
+  unite("Combined", Reef, Fraction, remove = FALSE)
+
+sample_data(Period3) <- sd
+
+sample_data(Period3)$Reef <-as.factor(sample_data(Period3)$Reef)
+sample_data(Period3)$Region <-as.factor(sample_data(Period3)$Region)
+sample_data(Period3)$Fraction <-as.factor(sample_data(Period3)$Fraction)
+
+Period3.reef <- merge_samples(Period3, "Combined")
+
+Period3.pruned <- prune_samples(sample_sums(Period3.reef)>80000, Period3.reef)
+
+Period3.rare <- rarefy_even_depth(Period3.pruned, sample.size = min(sample_sums(Period3.pruned)), 
+                                                       replace = FALSE, trimOTUs = TRUE, rngseed = 81, verbose = TRUE)
+
+Period3.rare_perc = transform_sample_counts(Period3.rare, function(OTU) OTU/sum(OTU)*100)
+
+
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 1] <- "Abu Madafi"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 2] <- "Abu Shoosha"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 3] <- "Al Fahal"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 4] <- "BK1"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 5] <- "BK2"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 6] <- "CAT"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 7] <- "DR07"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 8] <- "DR12"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 9] <- "FS11"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 10] <- "JD01"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 11] <- "JD02"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 12] <- "JD03"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 13] <- "JJI"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 14] <- "JKI"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 15] <- "North Al Lith"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 16] <- "South Al Lith"
+sample_data(Period3.rare_perc)$Reef[sample_data(Period3.rare_perc)$Reef == 17] <- "Whaleshark"
+
+
+
+
+sample_data(Period3.rare_perc)$Fraction[sample_data(Period3.rare_perc)$Fraction == 1] <- "106"
+sample_data(Period3.rare_perc)$Fraction[sample_data(Period3.rare_perc)$Fraction == 2] <- "500"
+sample_data(Period3.rare_perc)$Fraction[sample_data(Period3.rare_perc)$Fraction == 3] <- "Sessile"
+
+```
+
+
+
+```{r}
+Period3.rare_perc.class <- tax_glom(Period3.rare_perc , "Phylum")
+
+Period3.rare_perc.class.perc = transform_sample_counts(Period3.rare_perc.class, function(OTU) OTU/sum(OTU)*100)
+
+Period3.rare_perc.class.perc.filtered = filter_taxa(Period3.rare_perc.class.perc, function(x) mean(x) > 0.1, TRUE)
+
+
+Period3.rare_perc.class.perc.filtered.df <- psmelt(Period3.rare_perc.class.perc.filtered)
+
+
+Period3.rare_perc.class.perc.filtered.df$Reef <- factor(Period3.rare_perc.class.perc.filtered.df$Reef, 
+                                                        levels=c("JKI", "JJI",  "BK1", "BK2", "CAT",
+                                                                 "FS11", "South Al Lith", "Whaleshark", 
+                                                                 "North Al Lith", "JD03", "JD02", "JD01",
+                                                                 "Al Fahal", "Abu Shoosha","Abu Madafi",
+                                                                 "DR07", "DR12"))
+
+
+good_palette <- c("#df85a7",
+"#62c655",
+"#9a5acd",
+"#9fba36",
+"#c94fb1",
+"#51992d",
+"#5d6ecf",
+"#ceae3d",
+"#c790db",
+"#4dc381",
+"#e04281",
+"#468438",
+"#ce3646",
+"#45c4c9",
+"#dd582f",
+"#5f95d0",
+"#db8a2e",
+"#865794",
+"#8b8a2e",
+"#a93e6d",
+"#5ab18d",
+"#dc6c6e",
+"#317b54",
+"#a94c27",
+"#9eb66e",
+"#9d4e55",
+"#606d2b",
+"#e2906a",
+"#8e642a",
+"#c49f60")
+
+
+
+
+compositionplot <- Period3.rare_perc.class.perc.filtered.df %>%
+  ggplot(aes(y=Reef, x=Abundance, fill=Phylum)) + 
+  facet_wrap(~Fraction) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(name = "Taxonomy", values = good_palette) + 
+  theme_bw() + 
+  ylab("") + 
+  xlab("Proportion") + 
+  theme(axis.text.y = element_text(size=7, color="black")) +
+  theme(axis.title.x = element_text(size=8)) + 
+  theme(legend.title=element_blank()) + 
+  theme(legend.text=element_text(size=8, color="black")) + 
+  theme(plot.title=element_text(size=8, color="black")) + 
+  theme(axis.text.x= element_text(size=7, color="black")) +
+  theme(panel.background = element_rect(fill="transparent"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill="transparent", colour=NA),
+        legend.background = element_rect(fill="transparent"),
+        legend.key = element_rect(fill = NA)) + 
+  guides(fill = guide_legend(override.aes = list(size=1), ncol=2))
+
+
+
+
+cairo_ps(file="~/Documents/Bioinformatics/ARMStemporal/composition.eps", width=8, height=12)
+compositionplot
+dev.off()
+```
+
+
+#Save
+
+```{r}
+save.image("ARMS.temporal.shared_region.rdata")
+```
+
+
